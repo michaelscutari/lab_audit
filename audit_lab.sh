@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Config
-TARGET_DIR="/path/to/lab_storage" # must be absolute
-OUTPUT_DIR="${SCRIPT_DIR}/reports"
-GDU_BIN="gdu"
-PYTHON_CMD=("python3")
+TARGET_DIR="/hpc/group/singhlab/tools"
+OUTPUT_DIR="/hpc/group/singhlab/reports"
+GDU_BIN="/hpc/group/singhlab/tools/bin/gdu"
+PYTHON_BIN="python3"
 CONVERT_SCRIPT="${SCRIPT_DIR}/convert_gdu.py"
 
 if [[ "${TARGET_DIR}" != /* ]]; then
