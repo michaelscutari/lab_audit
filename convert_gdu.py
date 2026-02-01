@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Convert GDU JSON export to Parquet with tree-optimized schema.
-Uses streaming JSON parsing to bound memory usage.
+Convert GDU JSON export to Parquet with a tree-optimized schema.
+Streams JSON and writes parquet in batches to keep memory bounded.
 """
 
 import argparse
 import os
 import sys
-from typing import Iterator
+from dataclasses import dataclass
+from typing import Iterator, Optional, List
 
 import ijson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-BATCH_SIZE = 500_000
+BATCH_SIZE = 100_000
 
 SCHEMA = pa.schema([
     ('path', pa.string()),
@@ -28,91 +29,170 @@ SCHEMA = pa.schema([
 ])
 
 
-def parse_node(node, parent_path: str = "", depth: int = 0) -> Iterator[dict]:
-    """
-    Recursively parse NCDU-style node structure.
-    Directory = [ {metadata}, child1, child2, ... ]
-    File = {metadata}
+@dataclass
+class DirFrame:
+    name: str
+    path: str
+    parent: str
+    depth: int
+    size: int
+    usage: int
+    item_count: int = 0
 
-    Yields rows and computes item_count during traversal.
-    Returns (rows, item_count) where item_count is total files underneath.
-    """
-    if isinstance(node, list) and node:
-        info = node[0]
-        children = node[1:]
-        is_dir = True
-    elif isinstance(node, dict):
-        info = node
-        children = []
-        is_dir = False
-    else:
-        return
 
-    name = info.get('name', '')
-
-    # Handle root path
+def _build_path(parent_path: str, name: str) -> str:
     if parent_path:
         current_path = os.path.join(parent_path, name)
     else:
         current_path = name or "/"
+    if not current_path.startswith("/"):
+        current_path = "/" + current_path
+    return current_path
 
-    # Normalize path
-    if not current_path.startswith('/'):
-        current_path = '/' + current_path
 
-    size = info.get('asize', 0)
-    usage = info.get('dsize', 0)
+def _coerce_int(value) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except Exception:
+        return 0
 
-    # Process children first to compute item_count
-    child_rows = []
-    item_count = 0
 
-    for child in children:
-        for row in parse_node(child, current_path, depth + 1):
-            child_rows.append(row)
-            if row['path'] != current_path:  # Don't count self
-                if not row['is_dir']:
-                    item_count += 1
-                else:
-                    item_count += row['item_count']
+def _make_dir_frame(info: dict, parent: Optional[DirFrame]) -> DirFrame:
+    name = info.get("name", "") or ""
+    parent_path = parent.path if parent else ""
+    depth = (parent.depth + 1) if parent else 0
+    current_path = _build_path(parent_path, name)
+    return DirFrame(
+        name=name or "/",
+        path=current_path,
+        parent=parent_path,
+        depth=depth,
+        size=_coerce_int(info.get("asize", 0)),
+        usage=_coerce_int(info.get("dsize", 0)),
+    )
 
-    # Yield current node
-    yield {
-        'path': current_path,
-        'name': name or '/',
-        'parent': parent_path if parent_path else '',
-        'depth': depth,
-        'size': size,
-        'usage': usage,
-        'is_dir': is_dir,
-        'item_count': item_count if is_dir else 0,
+
+def _make_file_row(info: dict, parent: Optional[DirFrame]) -> Optional[dict]:
+    name = info.get("name", "")
+    if name is None:
+        name = ""
+    if name == "":
+        return None
+    parent_path = parent.path if parent else ""
+    depth = (parent.depth + 1) if parent else 0
+    current_path = _build_path(parent_path, name)
+    return {
+        "path": current_path,
+        "name": name,
+        "parent": parent_path,
+        "depth": depth,
+        "size": _coerce_int(info.get("asize", 0)),
+        "usage": _coerce_int(info.get("dsize", 0)),
+        "is_dir": False,
+        "item_count": 0,
     }
 
-    # Yield children
-    yield from child_rows
+
+def _dir_frame_to_row(frame: DirFrame) -> dict:
+    return {
+        "path": frame.path,
+        "name": frame.name or "/",
+        "parent": frame.parent,
+        "depth": frame.depth,
+        "size": frame.size,
+        "usage": frame.usage,
+        "is_dir": True,
+        "item_count": frame.item_count,
+    }
 
 
-def stream_json_root(filepath: str):
+def stream_nodes(filepath: str) -> Iterator[dict]:
     """
-    Stream parse JSON to find the root directory structure.
-    GDU exports are in NCDU format: [version, metadata, [root_dir]]
+    Stream NCDU-format JSON and yield rows.
+    Directories are emitted post-order so item_count can be computed.
     """
-    with open(filepath, 'rb') as f:
-        # Parse the top-level array items
-        parser = ijson.items(f, 'item')
-        items = list(parser)
+    with open(filepath, "rb") as f:
+        parser = ijson.basic_parse(f)
 
-        # Find the root directory (first list item that's a list)
-        for item in items:
-            if isinstance(item, list):
-                return item
+        container_stack = []
+        dir_stack: List[DirFrame] = []
 
-        # If no list found, try direct dict
-        for item in items:
-            if isinstance(item, dict):
-                return item
+        for event, value in parser:
+            if event == "start_array":
+                arr_ctx = {"type": "unknown", "index": 0, "frame": None}
+                container_stack.append({"type": "array", "ctx": arr_ctx})
+                continue
 
-    return None
+            if event == "end_array":
+                arr_ctx = container_stack.pop()["ctx"]
+                if arr_ctx["type"] == "dir" and arr_ctx.get("frame") is not None:
+                    frame = arr_ctx["frame"]
+                    yield _dir_frame_to_row(frame)
+                    if dir_stack and dir_stack[-1] is frame:
+                        dir_stack.pop()
+                    if dir_stack:
+                        dir_stack[-1].item_count += frame.item_count
+
+                if container_stack and container_stack[-1]["type"] == "array":
+                    container_stack[-1]["ctx"]["index"] += 1
+                continue
+
+            if event == "start_map":
+                obj_ctx = {"data": {}, "key": None}
+                container_stack.append({"type": "object", "ctx": obj_ctx})
+                continue
+
+            if event == "map_key":
+                container_stack[-1]["ctx"]["key"] = value
+                continue
+
+            if event in ("string", "number", "boolean", "null"):
+                if not container_stack:
+                    continue
+                top = container_stack[-1]
+                if top["type"] == "object":
+                    key = top["ctx"]["key"]
+                    if key == "name":
+                        top["ctx"]["data"]["name"] = value
+                    elif key in ("asize", "dsize"):
+                        top["ctx"]["data"][key] = _coerce_int(value)
+                elif top["type"] == "array":
+                    arr_ctx = top["ctx"]
+                    if arr_ctx["type"] == "unknown" and arr_ctx["index"] == 0:
+                        arr_ctx["type"] = "top"
+                    arr_ctx["index"] += 1
+                continue
+
+            if event == "end_map":
+                obj_ctx = container_stack.pop()["ctx"]
+                data = obj_ctx["data"]
+                parent = container_stack[-1] if container_stack else None
+
+                if parent and parent["type"] == "array":
+                    arr_ctx = parent["ctx"]
+                    if arr_ctx["type"] == "unknown" and arr_ctx["index"] == 0:
+                        arr_ctx["type"] = "dir" if data else "top"
+
+                    if arr_ctx["type"] == "dir":
+                        if arr_ctx["index"] == 0 and arr_ctx.get("frame") is None:
+                            frame = _make_dir_frame(data, dir_stack[-1] if dir_stack else None)
+                            arr_ctx["frame"] = frame
+                            dir_stack.append(frame)
+                        else:
+                            row = _make_file_row(data, dir_stack[-1] if dir_stack else None)
+                            if row is not None:
+                                yield row
+                                if dir_stack:
+                                    dir_stack[-1].item_count += 1
+
+                    arr_ctx["index"] += 1
+                else:
+                    row = _make_file_row(data, None)
+                    if row is not None:
+                        yield row
+                continue
 
 
 def write_batched_parquet(rows: Iterator[dict], output_path: str):
@@ -158,48 +238,18 @@ def main():
         sys.exit(f"Error: Input file not found: {args.input}")
 
     print(f"Reading {args.input}...")
-
-    # For streaming, we need to load the JSON structure
-    # ijson doesn't handle NCDU format well, so we use standard json for now
-    # but process in a memory-efficient way
-    import json
-
-    try:
-        with open(args.input, 'r') as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        sys.exit(f"Error: Invalid JSON: {e}")
-    except Exception as e:
-        sys.exit(f"Error reading file: {e}")
-
-    print("Finding root structure...")
-
-    # Find root directory in NCDU format
-    root = None
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, list):
-                root = item
-                break
-    elif isinstance(data, dict):
-        root = data
-
-    if root is None:
-        sys.exit("Error: Could not find root directory in JSON")
-
     print("Parsing tree structure...")
 
-    # Parse and write
-    rows = parse_node(root)
+    rows = stream_nodes(args.input)
     total = write_batched_parquet(rows, args.output)
 
     print(f"Success! Wrote {total:,} rows to {args.output}")
 
-    # Verify schema
+    # Verify schema without loading all data
     print("\nSchema verification:")
-    pq_file = pq.read_table(args.output)
-    print(pq_file.schema)
-    print(f"\nTotal rows: {len(pq_file):,}")
+    pq_file = pq.ParquetFile(args.output)
+    print(pq_file.schema_arrow)
+    print(f"\nTotal rows: {pq_file.metadata.num_rows:,}")
 
 
 if __name__ == '__main__':
