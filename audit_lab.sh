@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="/path/to/lab_storage" # must be absolute
 OUTPUT_DIR="${SCRIPT_DIR}/reports"
 GDU_BIN="gdu"
-PYTHON_BIN="python3"
+PYTHON_CMD=("python3")
 CONVERT_SCRIPT="${SCRIPT_DIR}/convert_gdu.py"
 
 if [[ "${TARGET_DIR}" != /* ]]; then
@@ -15,14 +15,29 @@ if [[ "${TARGET_DIR}" != /* ]]; then
   exit 1
 fi
 
-if [[ ! -x "$(command -v "${GDU_BIN}")" ]]; then
-  echo "GDU not found in PATH: ${GDU_BIN}" >&2
-  exit 1
+if [[ "${GDU_BIN}" = /* ]]; then
+  if [[ ! -x "${GDU_BIN}" ]]; then
+    echo "GDU not found: ${GDU_BIN}" >&2
+    exit 1
+  fi
+else
+  if ! command -v "${GDU_BIN}" >/dev/null 2>&1; then
+    echo "GDU not found in PATH: ${GDU_BIN}" >&2
+    exit 1
+  fi
 fi
 
-if [[ ! -x "$(command -v "${PYTHON_BIN}")" ]]; then
-  echo "Python not found in PATH: ${PYTHON_BIN}" >&2
-  exit 1
+python_exec="${PYTHON_CMD[0]}"
+if [[ "${python_exec}" = /* ]]; then
+  if [[ ! -x "${python_exec}" ]]; then
+    echo "Python runner not found: ${python_exec}" >&2
+    exit 1
+  fi
+else
+  if ! command -v "${python_exec}" >/dev/null 2>&1; then
+    echo "Python runner not found in PATH: ${python_exec}" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f "${CONVERT_SCRIPT}" ]]; then
@@ -42,7 +57,7 @@ echo "[1/2] Scanning filesystem..."
 "${GDU_BIN}" -n -c -o "${JSON_OUT}" "${TARGET_DIR}"
 
 echo "[2/2] Converting to Parquet..."
-"${PYTHON_BIN}" "${CONVERT_SCRIPT}" --input "${JSON_OUT}" --output "${PARQUET_OUT}"
+"${PYTHON_CMD[@]}" "${CONVERT_SCRIPT}" --input "${JSON_OUT}" --output "${PARQUET_OUT}"
 
 if [[ -f "${PARQUET_OUT}" ]]; then
   echo "Cleanup: Removing raw JSON..."
