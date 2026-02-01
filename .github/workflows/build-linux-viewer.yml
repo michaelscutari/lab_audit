@@ -14,23 +14,20 @@ permissions:
 jobs:
   build:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.24-bullseye
     steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y build-essential git
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24.x"
-          cache: true
-
       - name: Build linux viewer
         env:
-          CC: gcc-9
-          CXX: g++-9
           CGO_ENABLED: "1"
         run: |
           mkdir -p bin
@@ -40,6 +37,7 @@ jobs:
 
       - name: Commit binary
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if [[ -z "$(git status --porcelain bin/viewer)" ]]; then
             echo "No binary changes."
             exit 0
