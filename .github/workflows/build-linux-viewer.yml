@@ -32,7 +32,7 @@ jobs:
         run: |
           mkdir -p bin
           cd viewer
-          go build -o ../bin/viewer .
+          go build -buildvcs=false -o ../bin/viewer .
           chmod +x ../bin/viewer
 
       - name: Commit binary
